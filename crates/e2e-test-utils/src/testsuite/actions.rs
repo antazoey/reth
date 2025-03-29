@@ -2,13 +2,14 @@
 
 use crate::testsuite::Environment;
 use alloy_primitives::{Bytes, B256};
-use alloy_rpc_types_engine::{ForkchoiceState, PayloadStatusEnum};
+use alloy_rpc_types_engine::{ForkchoiceState, PayloadAttributes, PayloadStatusEnum};
 use alloy_rpc_types_eth::{Block, Header, Receipt, Transaction};
 use eyre::Result;
 use futures_util::future::BoxFuture;
 use reth_node_api::{EngineTypes, PayloadTypes};
 use reth_rpc_api::clients::{EngineApiClient, EthApiClient};
-use std::{future::Future, marker::PhantomData};
+use std::{future::Future, marker::PhantomData, time::Duration};
+use tokio::time::sleep;
 use tracing::debug;
 
 /// An action that can be performed on an instance.
@@ -157,26 +158,17 @@ where
     }
 }
 /// Pick the next block producer based on the latest block information.
-#[derive(Debug)]
-pub struct PickNextBlockProducer<Engine> {
-    /// Tracks engine type
-    _phantom: PhantomData<Engine>,
-}
+#[derive(Debug, Default)]
+pub struct PickNextBlockProducer {}
 
-impl<Engine> Default for PickNextBlockProducer<Engine> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl<Engine> PickNextBlockProducer<Engine> {
+impl PickNextBlockProducer {
     /// Create a new `PickNextBlockProducer` action
     pub fn new() -> Self {
-        Self { _phantom: Default::default() }
+        Self {}
     }
 }
 
-impl<Engine> Action<Engine> for PickNextBlockProducer<Engine>
+impl<Engine> Action<Engine> for PickNextBlockProducer
 where
     Engine: EngineTypes,
 {
@@ -225,6 +217,98 @@ where
         })
     }
 }
+
+/// Store payload attributes for the next block.
+#[derive(Debug, Default)]
+pub struct GeneratePayloadAttributes {}
+
+impl<Engine> Action<Engine> for GeneratePayloadAttributes
+where
+    Engine: EngineTypes,
+{
+    fn execute<'a>(&'a mut self, env: &'a mut Environment<Engine>) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            let latest_block = env
+                .latest_block_info
+                .as_ref()
+                .ok_or_else(|| eyre::eyre!("No latest block information available"))?;
+            let block_number = latest_block.number;
+            let timestamp = env.latest_header_time + env.block_timestamp_increment;
+            let payload_attributes = alloy_rpc_types_engine::PayloadAttributes {
+                timestamp,
+                prev_randao: B256::random(),
+                suggested_fee_recipient: alloy_primitives::Address::random(),
+                withdrawals: Some(vec![]),
+                parent_beacon_block_root: Some(B256::ZERO),
+            };
+
+            env.payload_attributes.insert(latest_block.number + 1, payload_attributes);
+            debug!("Stored payload attributes for block {}", block_number + 1);
+            Ok(())
+        })
+    }
+}
+/// Action that generates the next payload
+#[derive(Debug, Default)]
+pub struct GenerateNextPayload {}
+
+impl<Engine> Action<Engine> for GenerateNextPayload
+where
+    Engine: EngineTypes + PayloadTypes<PayloadAttributes = PayloadAttributes>,
+    reth_node_ethereum::engine::EthPayloadAttributes:
+        From<<Engine as EngineTypes>::ExecutionPayloadEnvelopeV3>,
+{
+    fn execute<'a>(&'a mut self, env: &'a mut Environment<Engine>) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            let latest_block = env
+                .latest_block_info
+                .as_ref()
+                .ok_or_else(|| eyre::eyre!("No latest block information available"))?;
+
+            let parent_hash = latest_block.hash;
+            debug!("Latest block hash: {parent_hash}");
+
+            let fork_choice_state = ForkchoiceState {
+                head_block_hash: parent_hash,
+                safe_block_hash: parent_hash,
+                finalized_block_hash: parent_hash,
+            };
+
+            let payload_attributes: PayloadAttributes = env
+                .payload_attributes
+                .get(&latest_block.number)
+                .cloned()
+                .ok_or_else(|| eyre::eyre!("No payload attributes found for latest block"))?;
+
+            let fcu_result = EngineApiClient::<Engine>::fork_choice_updated_v3(
+                &env.node_clients[0].engine,
+                fork_choice_state,
+                Some(payload_attributes.clone()),
+            )
+            .await?;
+
+            debug!("FCU result: {:?}", fcu_result);
+
+            let payload_id = fcu_result
+                .payload_id
+                .ok_or_else(|| eyre::eyre!("No payload ID returned from forkChoiceUpdated"))?;
+
+            debug!("Received payload ID: {:?}", payload_id);
+            env.next_payload_id = Some(payload_id);
+
+            sleep(Duration::from_secs(1)).await;
+
+            let built_payload: PayloadAttributes =
+                EngineApiClient::<Engine>::get_payload_v3(&env.node_clients[0].engine, payload_id)
+                    .await?
+                    .into();
+            env.payload_id_history.insert(latest_block.number + 1, payload_id);
+            env.latest_payload_built = Some(built_payload);
+
+            Ok(())
+        })
+    }
+}
 /// Action that produces a sequence of blocks using the available clients
 #[derive(Debug)]
 pub struct ProduceBlocks<Engine> {
@@ -254,7 +338,10 @@ where
     fn execute<'a>(&'a mut self, env: &'a mut Environment<Engine>) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             // Create a sequence for producing a single block
-            let mut sequence = Sequence::new(vec![Box::new(PickNextBlockProducer::default())]);
+            let mut sequence = Sequence::new(vec![
+                Box::new(PickNextBlockProducer::default()),
+                Box::new(GeneratePayloadAttributes::default()),
+            ]);
             for _ in 0..self.num_blocks {
                 sequence.execute(env).await?;
             }
