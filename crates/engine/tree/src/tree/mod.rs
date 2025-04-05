@@ -1176,26 +1176,7 @@ where
             return Ok(valid_outcome(state.head_block_hash))
         }
 
-        // 2. ensure we can apply a new chain update for the head block
-        if let Some(chain_update) = self.on_new_head(state.head_block_hash)? {
-            let tip = chain_update.tip().clone_sealed_header();
-            self.on_canonical_chain_update(chain_update);
-
-            // update the safe and finalized blocks and ensure their values are valid
-            if let Err(outcome) = self.ensure_consistent_forkchoice_state(state) {
-                // safe or finalized hashes are invalid
-                return Ok(TreeOutcome::new(outcome))
-            }
-
-            if let Some(attr) = attrs {
-                let updated = self.process_payload_attributes(attr, &tip, state, version);
-                return Ok(TreeOutcome::new(updated))
-            }
-
-            return Ok(valid_outcome(state.head_block_hash))
-        }
-
-        // 3. check if the head is already part of the canonical chain
+        // 2. check if the head is already part of the canonical chain
         if let Ok(Some(canonical_header)) = self.find_canonical_header(state.head_block_hash) {
             debug!(target: "engine::tree", head = canonical_header.number(), "fcu head block is already canonical");
 
@@ -1219,6 +1200,25 @@ where
 
             // the head block is already canonical, so we're not triggering a payload job and can
             // return right away
+            return Ok(valid_outcome(state.head_block_hash))
+        }
+
+        // 3. ensure we can apply a new chain update for the head block
+        if let Some(chain_update) = self.on_new_head(state.head_block_hash)? {
+            let tip = chain_update.tip().clone_sealed_header();
+            self.on_canonical_chain_update(chain_update);
+
+            // update the safe and finalized blocks and ensure their values are valid
+            if let Err(outcome) = self.ensure_consistent_forkchoice_state(state) {
+                // safe or finalized hashes are invalid
+                return Ok(TreeOutcome::new(outcome))
+            }
+
+            if let Some(attr) = attrs {
+                let updated = self.process_payload_attributes(attr, &tip, state, version);
+                return Ok(TreeOutcome::new(updated))
+            }
+
             return Ok(valid_outcome(state.head_block_hash))
         }
 
@@ -2531,7 +2531,8 @@ where
             maybe_state_root
         } else {
             // fallback is to compute the state root regularly in sync
-            debug!(target: "engine::tree", block=?block_num_hash, ?persisting_kind, "Failed to compute state root in parallel");
+            warn!(target: "engine::tree", block=?block_num_hash, ?persisting_kind, "Failed to compute state root in parallel");
+            self.metrics.block_validation.state_root_parallel_fallback_total.increment(1);
             let (root, updates) = state_provider.state_root_with_updates(hashed_state.clone())?;
             (root, updates, root_time.elapsed())
         };
@@ -3080,7 +3081,6 @@ mod tests {
     /// This is a test channel that allows you to `release` any value that is in the channel.
     ///
     /// If nothing has been sent, then the next value will be immediately sent.
-    #[allow(dead_code)]
     struct TestChannel<T> {
         /// If an item is sent to this channel, an item will be released in the wrapped channel
         release: Receiver<()>,
@@ -3092,7 +3092,6 @@ mod tests {
 
     impl<T: Send + 'static> TestChannel<T> {
         /// Creates a new test channel
-        #[allow(dead_code)]
         fn spawn_channel() -> (Sender<T>, Receiver<T>, TestChannelHandle) {
             let (original_tx, original_rx) = channel();
             let (wrapped_tx, wrapped_rx) = channel();
@@ -3156,7 +3155,7 @@ mod tests {
             Self::with_persistence_channel(chain_spec, action_tx, action_rx)
         }
 
-        #[allow(dead_code)]
+        #[expect(dead_code)]
         fn with_test_channel(chain_spec: Arc<ChainSpec>) -> (Self, TestChannelHandle) {
             let (action_tx, action_rx, handle) = TestChannel::spawn_channel();
             (Self::with_persistence_channel(chain_spec, action_tx, action_rx), handle)
